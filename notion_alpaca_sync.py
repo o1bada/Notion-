@@ -1,7 +1,6 @@
-
 from datetime import datetime
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify
 from notion_client import Client as NotionClient
 import alpaca_trade_api as tradeapi
 
@@ -18,54 +17,65 @@ app = Flask(__name__)
 notion = NotionClient(auth=NOTION_TOKEN)
 alpaca = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL)
 
-def get_stock_price(ticker: str) -> float:
-    try:
-        trade = alpaca.get_latest_trade(ticker)
-        return trade.price
-    except Exception as e:
-        print(f"Error getting price for {ticker}: {e}")
-        return 0.0
+def get_existing_tickers_from_notion():
+    response = notion.databases.query(database_id=NOTION_DATABASE_ID)
+    tickers = {}
+    for page in response.get('results', []):
+        try:
+            ticker = page["properties"]["Name"]["title"][0]["plain_text"]
+            tickers[ticker] = page["id"]
+        except:
+            continue
+    return tickers
 
 @app.route('/sync', methods=['GET'])
 def sync_stocks():
     updated_pages = []
+    created_pages = []
     deleted_pages = []
 
-    response = notion.databases.query(database_id=NOTION_DATABASE_ID)
-    for page in response.get('results', []):
-        page_id = page["id"]
-        properties = page["properties"]
-        try:
-            ticker = properties["Name"]["title"][0]["plain_text"]
-            quantity = properties.get("Quantity", {}).get("number", 0)
-            avg_price = properties.get("Average Price", {}).get("number", 0)
+    # Step 1: Fetch current positions from Alpaca
+    alpaca_positions = {p.symbol: p for p in alpaca.list_positions()}
 
-            if quantity == 0:
-                notion.pages.update(page_id=page_id, archived=True)
-                deleted_pages.append(ticker)
-                continue
+    # Step 2: Fetch existing pages from Notion
+    notion_pages = get_existing_tickers_from_notion()
 
-            current_price = get_stock_price(ticker)
-            unrealized_pl = (current_price - avg_price) * quantity
-            pl_percent = ((current_price - avg_price) / avg_price) * 100 if avg_price else 0
-            market_value = current_price * quantity
+    for ticker, position in alpaca_positions.items():
+        qty = float(position.qty)
+        avg_price = float(position.avg_entry_price)
+        current_price = float(position.current_price)
+        unrealized_pl = float(position.unrealized_pl)
+        pl_percent = float(position.unrealized_plpc) * 100
+        market_value = float(position.market_value)
 
-            notion.pages.update(
-                page_id=page_id,
-                properties={
-                    "Current Price": {"number": current_price},
-                    "Unrealized P&L": {"number": unrealized_pl},
-                    "P&L %": {"number": pl_percent},
-                    "Market Value": {"number": market_value},
-                    "Last Updated": {"date": {"start": datetime.utcnow().isoformat()}}
-                }
-            )
+        props = {
+            "Name": {"title": [{"text": {"content": ticker}}]},
+            "Average Price": {"number": avg_price},
+            "Current Price": {"number": current_price},
+            "Quantity": {"number": qty},
+            "Unrealized P&L": {"number": unrealized_pl},
+            "P&L %": {"number": pl_percent},
+            "Market Value": {"number": market_value},
+            "Last Updated": {"date": {"start": datetime.utcnow().isoformat()}}
+        }
+
+        if ticker in notion_pages:
+            notion.pages.update(page_id=notion_pages[ticker], properties=props)
             updated_pages.append(ticker)
-        except Exception as e:
-            print(f"Error processing page: {e}")
+        else:
+            notion.pages.create(parent={"database_id": NOTION_DATABASE_ID}, properties=props)
+            created_pages.append(ticker)
+
+    # Step 3: Delete Notion pages for positions no longer in Alpaca
+    alpaca_tickers = set(alpaca_positions.keys())
+    for ticker, page_id in notion_pages.items():
+        if ticker not in alpaca_tickers:
+            notion.pages.update(page_id=page_id, archived=True)
+            deleted_pages.append(ticker)
 
     return jsonify({
         "updated": updated_pages,
+        "created": created_pages,
         "deleted": deleted_pages,
         "status": "sync complete"
     })
